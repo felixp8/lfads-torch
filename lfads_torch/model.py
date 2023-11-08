@@ -1,6 +1,7 @@
 import pytorch_lightning as pl
 import torch
 from torch import nn
+from typing import Optional
 
 from .metrics import ExpSmoothedMetric, r2_score, regional_bits_per_spike
 from .modules import augmentations
@@ -28,6 +29,11 @@ class LFADS(pl.LightningModule):
         ic_dim: int,
         gen_dim: int,
         fac_dim: int,
+        ic_encoder: nn.Module, 
+        ci_encoder: Optional[nn.Module],
+        gen_cell: nn.Module, 
+        fac_linear: nn.Module,
+        con_cell: Optional[nn.Module],
         dropout_rate: float,
         reconstruction: nn.ModuleList,
         variational: bool,
@@ -78,8 +84,8 @@ class LFADS(pl.LightningModule):
         # Decide whether to use the controller
         self.use_con = all([ci_enc_dim > 0, con_dim > 0, co_dim > 0])
         # Create the encoder and decoder
-        self.encoder = Encoder(hparams=self.hparams)
-        self.decoder = Decoder(hparams=self.hparams)
+        self.encoder = Encoder(hparams=self.hparams, ic_encoder=ic_encoder, ci_encoder=ci_encoder)
+        self.decoder = Decoder(hparams=self.hparams, gen_cell=gen_cell, fac_linear=fac_linear, con_cell=con_cell)
         # Store the readout network
         self.readout = readout
         # Create object to manage reconstruction

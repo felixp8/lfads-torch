@@ -57,3 +57,20 @@ def send_batch_to_device(batch, device):
             )
 
     return send_to_device(batch)
+
+
+def get_act_func(activation: str):
+    if activation.lower() == "relu": 
+        return torch.nn.ReLU
+    elif activation.lower() == "tanh":
+        return torch.nn.Tanh
+    elif activation.lower() == "sigmoid":
+        return torch.nn.Sigmoid
+    elif activation.lower() == "elu": 
+        return torch.nn.ELU
+    elif activation.lower() == "glu": 
+        return torch.nn.GLU
+    elif activation.lower() == "gelu": 
+        return torch.nn.GELU
+    else:
+        raise ValueError(f"activation {activation} not recognized")

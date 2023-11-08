@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
+from typing import Optional
 
 from .initializers import init_linear_
 from .recurrent import ClippedGRUCell
@@ -13,16 +14,21 @@ class KernelNormalizedLinear(nn.Linear):
 
 
 class DecoderCell(nn.Module):
-    def __init__(self, hparams):
+    def __init__(
+        self, 
+        hparams: dict,
+        gen_cell: nn.Module, 
+        fac_linear: nn.Module,
+        con_cell: Optional[nn.Module] = None,
+    ):
         super().__init__()
         self.hparams = hps = hparams
         # Create the generator
-        self.gen_cell = ClippedGRUCell(
-            hps.ext_input_dim + hps.co_dim, hps.gen_dim, clip_value=hps.cell_clip
-        )
+        self.gen_cell = gen_cell
         # Create the mapping from generator states to factors
-        self.fac_linear = KernelNormalizedLinear(hps.gen_dim, hps.fac_dim, bias=False)
-        init_linear_(self.fac_linear)
+        self.fac_linear = fac_linear
+        if isinstance(self.fac_linear, nn.Linear):
+            init_linear_(self.fac_linear)
         # Create the dropout layer
         self.dropout = nn.Dropout(hps.dropout_rate)
         # Decide whether to use the controller
@@ -35,9 +41,7 @@ class DecoderCell(nn.Module):
         )
         if self.use_con:
             # Create the controller
-            self.con_cell = ClippedGRUCell(
-                2 * hps.ci_enc_dim + hps.fac_dim, hps.con_dim, clip_value=hps.cell_clip
-            )
+            self.con_cell = con_cell
             # Define the mapping from controller state to controller output parameters
             self.co_linear = nn.Linear(hps.con_dim, hps.co_dim * 2)
             init_linear_(self.co_linear)
@@ -93,9 +97,20 @@ class DecoderCell(nn.Module):
 
 
 class DecoderRNN(nn.Module):
-    def __init__(self, hparams):
+    def __init__(
+        self, 
+        hparams: dict,
+        gen_cell: nn.Module, 
+        fac_linear: nn.Module,
+        con_cell: Optional[nn.Module] = None,
+    ):
         super().__init__()
-        self.cell = DecoderCell(hparams=hparams)
+        self.cell = DecoderCell(
+            hparams=hparams, 
+            gen_cell=gen_cell, 
+            fac_linear=fac_linear,
+            con_cell=con_cell,
+        )
 
     def forward(self, input, h_0, sample_posteriors=True):
         hidden = h_0
@@ -109,7 +124,13 @@ class DecoderRNN(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, hparams):
+    def __init__(
+        self, 
+        hparams: dict, 
+        gen_cell: nn.Module, 
+        fac_linear: nn.Module,
+        con_cell: Optional[nn.Module] = None,
+    ):
         super().__init__()
         self.hparams = hps = hparams
 
@@ -118,7 +139,12 @@ class Decoder(nn.Module):
         self.ic_to_g0 = nn.Linear(hps.ic_dim, hps.gen_dim)
         init_linear_(self.ic_to_g0)
         # Create the decoder RNN
-        self.rnn = DecoderRNN(hparams=hparams)
+        self.rnn = DecoderRNN(
+            hparams=hparams, 
+            gen_cell=gen_cell, 
+            fac_linear=fac_linear,
+            con_cell=con_cell,
+        )
         # Initial hidden state for controller
         self.con_h0 = nn.Parameter(torch.zeros((1, hps.con_dim), requires_grad=True))
 

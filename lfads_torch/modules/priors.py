@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from torch.distributions import Independent, Normal, StudentT, kl_divergence
+from torch.distributions import Independent, Normal, StudentT, Laplace, kl_divergence
 from torch.distributions.transforms import AffineTransform
 
 
@@ -18,12 +18,13 @@ class MultivariateNormal(nn.Module):
         mean: float,
         variance: float,
         shape: int,
+        trainable: bool = True,
     ):
         super().__init__()
         # Create distribution parameter tensors
         means = torch.ones(shape) * mean
         logvars = torch.log(torch.ones(shape) * variance)
-        self.mean = nn.Parameter(means, requires_grad=True)
+        self.mean = nn.Parameter(means, requires_grad=trainable)
         self.logvar = nn.Parameter(logvars, requires_grad=False)
 
     def make_posterior(self, post_mean, post_std):
@@ -46,13 +47,14 @@ class AutoregressiveMultivariateNormal(nn.Module):
         tau: float,
         nvar: float,
         shape: int,
+        trainable: bool = True,
     ):
         super().__init__()
         # Create the distribution parameters
         logtaus = torch.log(torch.ones(shape) * tau)
         lognvars = torch.log(torch.ones(shape) * nvar)
-        self.logtaus = nn.Parameter(logtaus, requires_grad=True)
-        self.lognvars = nn.Parameter(lognvars, requires_grad=True)
+        self.logtaus = nn.Parameter(logtaus, requires_grad=trainable)
+        self.lognvars = nn.Parameter(lognvars, requires_grad=trainable)
 
     def make_posterior(self, post_mean, post_std):
         return Independent(Normal(post_mean, post_std), 2)
@@ -90,13 +92,14 @@ class MultivariateStudentT(nn.Module):
         scale: float,
         df: int,
         shape: int,
+        trainable: bool = True,
     ):
         super().__init__()
         # Create the distribution parameters
         loc = torch.ones(shape) * scale
-        self.loc = nn.Parameter(loc, requires_grad=True)
+        self.loc = nn.Parameter(loc, requires_grad=trainable)
         logscale = torch.log(torch.ones(shape) * scale)
-        self.logscale = nn.Parameter(logscale, requires_grad=True)
+        self.logscale = nn.Parameter(logscale, requires_grad=trainable)
         self.df = df
 
     def make_posterior(self, post_loc, post_scale):
@@ -114,4 +117,32 @@ class MultivariateStudentT(nn.Module):
         log_q = posterior.log_prob(sample)
         log_p = prior.log_prob(sample)
         kl_batch = log_q - log_p
+        return torch.mean(kl_batch)
+
+
+class MultivariateLaplace(nn.Module):
+    def __init__(
+        self,
+        mean: float,
+        scale: float,  # scale (b) parameter for Laplace distribution
+        shape: int,
+        trainable: bool = True,
+    ):
+        super().__init__()
+        # Create distribution parameter tensors
+        means = torch.ones(shape) * mean
+        scales = torch.ones(shape) * scale
+        self.mean = nn.Parameter(means, requires_grad=trainable)
+        self.scale = nn.Parameter(scales, requires_grad=trainable)
+
+    def make_posterior(self, post_mean, post_std):
+        return Independent(Laplace(post_mean, post_std), 1)
+
+    def forward(self, post_mean, post_std):
+        # Create the posterior distribution
+        posterior = self.make_posterior(post_mean, post_std)
+        # Create the prior with Laplace distribution
+        prior = Independent(Laplace(0, self.scale), 1)
+        # Compute KL analytically
+        kl_batch = kl_divergence(posterior, prior)
         return torch.mean(kl_batch)

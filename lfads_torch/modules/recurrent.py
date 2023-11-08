@@ -1,7 +1,12 @@
 import torch
 from torch import nn
+from typing import Optional
 
-from .initializers import init_gru_cell_
+from .initializers import init_gru_cell_, init_linear_
+from ..utils import get_act_func
+
+
+########### cells ###########
 
 
 class ClippedGRUCell(nn.GRUCell):
@@ -35,20 +40,103 @@ class ClippedGRUCell(nn.GRUCell):
         return hidden
 
 
-class ClippedGRU(nn.Module):
+class MLPRNNCell(nn.Module):
     def __init__(
         self,
         input_size: int,
         hidden_size: int,
-        clip_value: float = float("inf"),
+        vf_hidden_size: int = 128,
+        vf_num_layers: int = 2,
+        activation: str = "gelu",
+        scale: float = 0.1,
     ):
         super().__init__()
-        self.cell = ClippedGRUCell(
-            input_size, hidden_size, clip_value=clip_value, is_encoder=True
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+
+        act_func = get_act_func(activation)
+        vector_field = []
+        vector_field.append(nn.Linear(hidden_size + input_size, vf_hidden_size))
+        vector_field.append(act_func())
+        for k in range(vf_num_layers - 1):
+            vector_field.append(nn.Linear(vf_hidden_size, vf_hidden_size))
+            vector_field.append(act_func())
+
+        vector_field.append(nn.Linear(vf_hidden_size, hidden_size))
+        self.network = nn.Sequential(*vector_field)
+        self.scale = scale
+
+        for layer in self.network:
+            if isinstance(layer, nn.Linear):
+                init_linear_(layer)
+
+    def forward(self, input, hidden):
+        input_hidden = torch.cat([hidden, input], dim=1)
+        return hidden + self.scale * self.network(input_hidden)
+
+
+class LowRankRNNCell(nn.Module):
+    def __init__(
+        self, 
+        input_size: int,
+        hidden_size: int,
+        rank: int,
+        activation: str = "tanh",
+        alpha: float = 0.2,
+    ):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        
+        self.alpha = alpha
+        self.act_func = get_act_func(activation)
+
+        self.m = nn.Parameter(torch.Tensor(hidden_size, rank))
+        self.n = nn.Parameter(torch.Tensor(hidden_size, rank))
+        self.b = nn.Parameter(torch.Tensor(1, hidden_size))
+        self.wi = nn.Parameter(torch.Tensor(input_size, hidden_size))
+
+        with torch.no_grad():
+            self.m.normal_()
+            self.n.normal_()
+            self.b.zero_()
+            self.wi.normal_()
+
+    def forward(self, input, hidden):
+        input = input @ self.wi
+        hidden = hidden + self.alpha * (
+            -hidden + input + 
+            self.act_func(hidden + self.b) @ self.n @ self.m.T)
+        return hidden
+
+
+# CELLS = {
+#     "ClippedGRUCell": ClippedGRUCell,
+#     "MLPRNNCell": MLPRNNCell,
+# }
+
+
+########### RNNs ###########
+
+
+class RNN(nn.Module):
+    def __init__(
+        self,
+        cell: nn.Module,
+        learnable_ic: bool = True,
+    ):
+        super().__init__()
+        self.cell = cell
+        self.h_0 = nn.Parameter(
+            torch.zeros((1, 1, cell.hidden_size), requires_grad=learnable_ic)
         )
 
-    def forward(self, input: torch.Tensor, h_0: torch.Tensor):
-        hidden = h_0
+    def forward(self, input: torch.Tensor, h_0: Optional[torch.Tensor] = None):
+        batch_size = input.shape[0]
+        if h_0 is None:
+            hidden = torch.tile(self.h_0, (1, batch_size, 1))
+        else:
+            hidden = h_0
         input = torch.transpose(input, 0, 1)
         output = []
         for input_step in input:
@@ -58,24 +146,82 @@ class ClippedGRU(nn.Module):
         return output, hidden
 
 
-class BidirectionalClippedGRU(nn.Module):
+def define_rnn_class(cell_class: type) -> type:
+    rnn_class_name = cell_class.__name__.replace("Cell", "")
+
+    def constructor(self, **kwargs):
+        cell = cell_class(**kwargs)
+        super(self.__class__, self).__init__(cell=cell)
+    
+    return rnn_class_name, type(
+        rnn_class_name, # class name
+        (RNN,), # base class
+        {
+            '__init__': constructor,
+        }
+    )
+
+
+# RNNS = {}
+# for cell_name, cell_class in CELLS.items():
+#     rnn_class_name, rnn_class = define_rnn_class(cell_class)
+#     RNNS[rnn_class_name] = rnn_class
+
+ClippedGRU = define_rnn_class(ClippedGRUCell)
+MLPRNN = define_rnn_class(MLPRNNCell)
+LowRankRNN = define_rnn_class(LowRankRNNCell)
+
+
+########### Bidirectional RNNs ###########
+
+
+class BidirectionalRNN(nn.Module):
     def __init__(
         self,
-        input_size: int,
-        hidden_size: int,
-        clip_value: float = float("inf"),
+        fwd_rnn: nn.Module,
+        bwd_rnn: nn.Module,
     ):
         super().__init__()
-        self.fwd_gru = ClippedGRU(input_size, hidden_size, clip_value=clip_value)
-        self.bwd_gru = ClippedGRU(input_size, hidden_size, clip_value=clip_value)
+        self.fwd_rnn = fwd_rnn
+        self.bwd_rnn = bwd_rnn
 
-    def forward(self, input: torch.Tensor, h_0: torch.Tensor):
-        h0_fwd, h0_bwd = h_0
+    def forward(self, input: torch.Tensor, h_0: Optional[torch.Tensor] = None):
+        if h_0 is None:
+            h0_fwd = h0_bwd = None
+        else:
+            h0_fwd, h0_bwd = h_0
         input_fwd = input
         input_bwd = torch.flip(input, [1])
-        output_fwd, hn_fwd = self.fwd_gru(input_fwd, h0_fwd)
-        output_bwd, hn_bwd = self.bwd_gru(input_bwd, h0_bwd)
+        output_fwd, hn_fwd = self.fwd_rnn(input_fwd, h0_fwd)
+        output_bwd, hn_bwd = self.bwd_rnn(input_bwd, h0_bwd)
         output_bwd = torch.flip(output_bwd, [1])
         output = torch.cat([output_fwd, output_bwd], dim=2)
         h_n = torch.stack([hn_fwd, hn_bwd])
         return output, h_n
+
+
+def define_bidirectional_rnn_class(rnn_class: type) -> type:
+    bidirectional_rnn_class_name = "Bidirectional" + rnn_class.__name__
+
+    def constructor(self, **kwargs):
+        fwd_rnn = rnn_class(**kwargs)
+        bwd_rnn = rnn_class(**kwargs)
+        super(self.__class__, self).__init__(fwd_rnn=fwd_rnn, bwd_rnn=bwd_rnn)
+    
+    return type(
+        bidirectional_rnn_class_name, # class name
+        (BidirectionalRNN,), # base class
+        {
+            '__init__': constructor,
+        }
+    )
+
+
+# BIDIR_RNNS = {}
+# for rnn_type, rnn_class in RNNS.items():
+#     birnn_class_name, birnn_class = define_bidirectional_rnn_class(rnn_class)
+#     BIDIR_RNNS[birnn_class_name] = birnn_class
+
+BidirectionalClippedGRU = define_bidirectional_rnn_class(ClippedGRU)
+BidirectionalMLPRNN = define_bidirectional_rnn_class(MLPRNN)
+BidirectionalLowRankRNN = define_bidirectional_rnn_class(LowRankRNN)

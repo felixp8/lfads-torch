@@ -1,26 +1,24 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
+from typing import Optional
 
 from .initializers import init_linear_
 from .recurrent import BidirectionalClippedGRU
 
 
 class Encoder(nn.Module):
-    def __init__(self, hparams: dict):
+    def __init__(
+        self, 
+        hparams: dict, 
+        ic_encoder: nn.Module, 
+        ci_encoder: Optional[nn.Module] = None,
+    ):
         super().__init__()
         self.hparams = hps = hparams
 
-        # Initial hidden state for IC encoder
-        self.ic_enc_h0 = nn.Parameter(
-            torch.zeros((2, 1, hps.ic_enc_dim), requires_grad=True)
-        )
         # Initial condition encoder
-        self.ic_enc = BidirectionalClippedGRU(
-            input_size=hps.encod_data_dim,
-            hidden_size=hps.ic_enc_dim,
-            clip_value=hps.cell_clip,
-        )
+        self.ic_enc = ic_encoder
         # Mapping from final IC encoder state to IC parameters
         self.ic_linear = nn.Linear(hps.ic_enc_dim * 2, hps.ic_dim * 2)
         init_linear_(self.ic_linear)
@@ -33,16 +31,8 @@ class Encoder(nn.Module):
             ]
         )
         if self.use_con:
-            # Initial hidden state for CI encoder
-            self.ci_enc_h0 = nn.Parameter(
-                torch.zeros((2, 1, hps.ci_enc_dim), requires_grad=True)
-            )
             # CI encoder
-            self.ci_enc = BidirectionalClippedGRU(
-                input_size=hps.encod_data_dim,
-                hidden_size=hps.ci_enc_dim,
-                clip_value=hps.cell_clip,
-            )
+            self.ci_enc = ci_encoder
         # Activation dropout layer
         self.dropout = nn.Dropout(hps.dropout_rate)
 
@@ -62,8 +52,7 @@ class Encoder(nn.Module):
             ic_enc_data = data_drop
             ci_enc_data = data_drop
         # Pass data through IC encoder
-        ic_enc_h0 = torch.tile(self.ic_enc_h0, (1, batch_size, 1))
-        _, h_n = self.ic_enc(ic_enc_data, ic_enc_h0)
+        _, h_n = self.ic_enc(ic_enc_data)
         h_n = torch.cat([*h_n], dim=1)
         # Compute initial condition posterior
         h_n_drop = self.dropout(h_n)
@@ -72,8 +61,7 @@ class Encoder(nn.Module):
         ic_std = torch.sqrt(torch.exp(ic_logvar) + hps.ic_post_var_min)
         if self.use_con:
             # Pass data through CI encoder
-            ci_enc_h0 = torch.tile(self.ci_enc_h0, (1, batch_size, 1))
-            ci, _ = self.ci_enc(ci_enc_data, ci_enc_h0)
+            ci, _ = self.ci_enc(ci_enc_data)
             # Add a lag to the controller input
             ci_fwd, ci_bwd = torch.split(ci, hps.ci_enc_dim, dim=2)
             ci_fwd = F.pad(ci_fwd, (0, 0, hps.ci_lag, 0, 0, 0))
