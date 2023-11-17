@@ -17,6 +17,7 @@ class LFADS(pl.LightningModule):
     def __init__(
         self,
         encod_data_dim: int,
+        recon_data_dim: int,
         encod_seq_len: int,
         recon_seq_len: int,
         ext_input_dim: int,
