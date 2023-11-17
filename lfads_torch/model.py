@@ -70,7 +70,10 @@ class LFADS(pl.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters(
-            ignore=["ic_prior", "co_prior", "reconstruction", "readin", "readout"],
+            ignore=[
+                "ic_prior", "co_prior", "reconstruction", "readin", "readout",
+                "ic_encoder", "ci_encoder", "gen_cell", "fac_linear", "con_cell",
+            ],
         )
         # Store `co_prior` on `hparams` so it can be accessed in decoder
         self.hparams.co_prior = co_prior

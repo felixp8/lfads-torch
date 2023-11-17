@@ -23,6 +23,7 @@ def run_model(
     config_path: str = "../configs/single.yaml",
     do_train: bool = True,
     do_posterior_sample: bool = True,
+    save_config: bool = True,
 ):
     """Adds overrides to the default config, instantiates all PyTorch Lightning
     objects from config, and runs the training pipeline.
@@ -83,6 +84,8 @@ def run_model(
         if config.posterior_sampling.use_best_ckpt:
             ckpt_path = trainer.checkpoint_callback.best_model_path
             model.load_state_dict(torch.load(ckpt_path)["state_dict"])
+        if save_config:
+            OmegaConf.save(config, "config.yaml", resolve=True)
     else:
         if checkpoint_dir:
             # If not training, restore model from the checkpoint
