@@ -59,16 +59,18 @@ class FlowReadout(nn.Module):
         vf_hidden_dim: int = 128,
         num_layers: int = 2,
         num_steps: int = 20,
+        activation: str = "gelu",
         scale: float = 0.1,
     ):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
-        self.pad_dim = input_dim - output_dim
+        self.pad_dim = output_dim - input_dim
+        assert self.pad_dim >= 0, f"output dim must be >= input dim"
         self.num_steps = num_steps
         self.scale = scale
 
-        act_func = torch.nn.ReLU
+        act_func = get_act_func(activation)
         vector_field = []
         vector_field.append(nn.Linear(output_dim, vf_hidden_dim))
         vector_field.append(act_func())

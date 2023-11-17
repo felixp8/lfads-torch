@@ -124,16 +124,16 @@ class MultivariateLaplace(nn.Module):
     def __init__(
         self,
         mean: float,
-        scale: float,  # scale (b) parameter for Laplace distribution
+        scale: float,
         shape: int,
         trainable: bool = True,
     ):
         super().__init__()
         # Create distribution parameter tensors
         means = torch.ones(shape) * mean
-        scales = torch.ones(shape) * scale
+        logscales = torch.log(torch.ones(shape) * scale)
         self.mean = nn.Parameter(means, requires_grad=trainable)
-        self.scale = nn.Parameter(scales, requires_grad=trainable)
+        self.logscale = nn.Parameter(logscales, requires_grad=trainable)
 
     def make_posterior(self, post_mean, post_std):
         return Independent(Laplace(post_mean, post_std), 1)
@@ -142,7 +142,8 @@ class MultivariateLaplace(nn.Module):
         # Create the posterior distribution
         posterior = self.make_posterior(post_mean, post_std)
         # Create the prior with Laplace distribution
-        prior = Independent(Laplace(0, self.scale), 1)
+        prior_scale = torch.exp(self.logscale)
+        prior = Independent(Laplace(self.mean, prior_scale), 1)
         # Compute KL analytically
         kl_batch = kl_divergence(posterior, prior)
         return torch.mean(kl_batch)

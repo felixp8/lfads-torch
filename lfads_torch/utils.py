@@ -72,5 +72,7 @@ def get_act_func(activation: str):
         return torch.nn.GLU
     elif activation.lower() == "gelu": 
         return torch.nn.GELU
+    elif activation.lower() in ["none", "identity"]:
+        return torch.nn.Identity
     else:
         raise ValueError(f"activation {activation} not recognized")

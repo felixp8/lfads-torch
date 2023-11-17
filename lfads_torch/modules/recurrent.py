@@ -1,8 +1,9 @@
 import torch
+import math
 from torch import nn
 from typing import Optional
 
-from .initializers import init_gru_cell_, init_linear_
+from .initializers import init_gru_cell_
 from ..utils import get_act_func
 
 
@@ -39,6 +40,11 @@ class ClippedGRUCell(nn.GRUCell):
         hidden = torch.clamp(hidden, -self.clip_value, self.clip_value)
         return hidden
 
+    @property
+    def rec_weight(self):
+        """Recurrent weight to apply L2 penalty to"""
+        return self.weight_hh
+
 
 class MLPRNNCell(nn.Module):
     def __init__(
@@ -66,13 +72,17 @@ class MLPRNNCell(nn.Module):
         self.network = nn.Sequential(*vector_field)
         self.scale = scale
 
-        for layer in self.network:
-            if isinstance(layer, nn.Linear):
-                init_linear_(layer)
-
     def forward(self, input, hidden):
         input_hidden = torch.cat([hidden, input], dim=1)
         return hidden + self.scale * self.network(input_hidden)
+        
+    @property
+    def rec_weight(self):
+        """Recurrent weight to apply L2 penalty to"""
+        return torch.cat([
+            layer.weight.flatten() for layer in self.network 
+            if isinstance(layer, nn.Linear)
+        ])
 
 
 class LowRankRNNCell(nn.Module):
@@ -89,7 +99,7 @@ class LowRankRNNCell(nn.Module):
         self.hidden_size = hidden_size
         
         self.alpha = alpha
-        self.act_func = get_act_func(activation)
+        self.act_func = get_act_func(activation)()
 
         self.m = nn.Parameter(torch.Tensor(hidden_size, rank))
         self.n = nn.Parameter(torch.Tensor(hidden_size, rank))
@@ -97,10 +107,10 @@ class LowRankRNNCell(nn.Module):
         self.wi = nn.Parameter(torch.Tensor(input_size, hidden_size))
 
         with torch.no_grad():
-            self.m.normal_()
-            self.n.normal_()
+            self.m.normal_(std=1/math.sqrt(rank))
+            self.n.normal_(std=1)
             self.b.zero_()
-            self.wi.normal_()
+            self.wi.normal_(std=1/math.sqrt(input_size))
 
     def forward(self, input, hidden):
         input = input @ self.wi
@@ -109,11 +119,10 @@ class LowRankRNNCell(nn.Module):
             self.act_func(hidden + self.b) @ self.n @ self.m.T)
         return hidden
 
-
-# CELLS = {
-#     "ClippedGRUCell": ClippedGRUCell,
-#     "MLPRNNCell": MLPRNNCell,
-# }
+    @property
+    def rec_weight(self):
+        """Recurrent weight to apply L2 penalty to"""
+        return torch.cat([self.m.flatten(), self.n.flatten()])
 
 
 ########### RNNs ###########
@@ -128,13 +137,13 @@ class RNN(nn.Module):
         super().__init__()
         self.cell = cell
         self.h_0 = nn.Parameter(
-            torch.zeros((1, 1, cell.hidden_size), requires_grad=learnable_ic)
+            torch.zeros((1, cell.hidden_size), requires_grad=learnable_ic)
         )
 
     def forward(self, input: torch.Tensor, h_0: Optional[torch.Tensor] = None):
         batch_size = input.shape[0]
         if h_0 is None:
-            hidden = torch.tile(self.h_0, (1, batch_size, 1))
+            hidden = torch.tile(self.h_0, (batch_size, 1))
         else:
             hidden = h_0
         input = torch.transpose(input, 0, 1)
@@ -153,7 +162,7 @@ def define_rnn_class(cell_class: type) -> type:
         cell = cell_class(**kwargs)
         super(self.__class__, self).__init__(cell=cell)
     
-    return rnn_class_name, type(
+    return type(
         rnn_class_name, # class name
         (RNN,), # base class
         {
@@ -161,11 +170,6 @@ def define_rnn_class(cell_class: type) -> type:
         }
     )
 
-
-# RNNS = {}
-# for cell_name, cell_class in CELLS.items():
-#     rnn_class_name, rnn_class = define_rnn_class(cell_class)
-#     RNNS[rnn_class_name] = rnn_class
 
 ClippedGRU = define_rnn_class(ClippedGRUCell)
 MLPRNN = define_rnn_class(MLPRNNCell)
@@ -216,11 +220,6 @@ def define_bidirectional_rnn_class(rnn_class: type) -> type:
         }
     )
 
-
-# BIDIR_RNNS = {}
-# for rnn_type, rnn_class in RNNS.items():
-#     birnn_class_name, birnn_class = define_bidirectional_rnn_class(rnn_class)
-#     BIDIR_RNNS[birnn_class_name] = birnn_class
 
 BidirectionalClippedGRU = define_bidirectional_rnn_class(ClippedGRU)
 BidirectionalMLPRNN = define_bidirectional_rnn_class(MLPRNN)
