@@ -37,6 +37,12 @@ def attach_tensors(datamodule, data_dicts: list[dict], extra_keys: list[str] = [
                 recon_data = to_tensor(data_dict[f"{prefix}_recon_data"])
             else:
                 recon_data = torch.zeros(n_samps, 0, 0)
+            encod_mask = torch.isnan(encod_data).to(torch.bool)
+            recon_mask = torch.isnan(recon_data).to(torch.bool)
+            if torch.any(recon_mask):
+                impute_value = hps.impute_value or 0
+                encod_data[encod_mask] = impute_value
+                recon_data[recon_mask] = impute_value
             if hps.sv_rate > 0:
                 # Create sample validation mask # TODO: Sparse and use complement?
                 bern_p = 1 - hps.sv_rate if prefix != "test" else 1.0
@@ -46,17 +52,54 @@ def attach_tensors(datamodule, data_dicts: list[dict], extra_keys: list[str] = [
             else:
                 # Create a placeholder tensor
                 sv_mask = torch.ones(n_samps, 0, 0)
+            # Load or simulate temporal context
+            if getattr(hps, "temp_context_field"):
+                temp_context_field = hps.temp_context_field
+                temp_context = to_tensor(data_dict[f"{prefix}_{temp_context_field}"])[:, None]
+                if getattr(hps, "rescale_temp_context"):
+                    temp_context -= getattr(hps, "rescale_temp_context_min", 0.0)
+                    temp_context /= (
+                        getattr(hps, "rescale_temp_context_max", 1.0) - 
+                        getattr(hps, "rescale_temp_context_min", 0.0))
+            else:
+                temp_context = torch.zeros(n_samps, 0)
             # Load or simulate external inputs
-            if f"{prefix}_ext_input" in data_dict:
+            if getattr(hps, "ext_input_fields"):
+                ext_input_fields = hps.ext_input_fields
+                ext_input = []
+                for field in ext_input_fields:
+                    ext_input.append(to_tensor(data_dict[f"{prefix}_{field}"]))
+                ext_input = torch.cat(ext_input, dim=-1)
+            elif f"{prefix}_ext_input" in data_dict and hps.use_ext_input:
                 ext_input = to_tensor(data_dict[f"{prefix}_ext_input"])
             else:
                 ext_input = torch.zeros(n_samps, n_steps, 0)
+            if getattr(hps, "ext_input_lag"):
+                ext_input = torch.cat([
+                    torch.tile(ext_input[:, 0:1, :], (1, hps.ext_input_lag, 1)) * torch.arange(0, 1, hps.ext_input_lag)[None, :, None],
+                    ext_input[:, :-hps.ext_input_lag, :],
+                ])
             if f"{prefix}_truth" in data_dict:
                 # Load or simulate ground truth TODO: use None instead of NaN?
                 cf = data_dict["conversion_factor"]
                 truth = to_tensor(data_dict[f"{prefix}_truth"]) / cf
             else:
                 truth = torch.full((n_samps, 0, 0), float("nan"))
+            if getattr(hps, "spike_std_field"):
+                spike_means = to_tensor(data_dict[hps.spike_mean_field])
+                spike_stds = to_tensor(data_dict[hps.spike_std_field])
+                spike_means = spike_means.tile((n_samps, 1))
+                spike_stds = spike_stds.tile((n_samps, 1))
+                mean_std = torch.stack([spike_means, spike_stds], dim=-1)
+                heldin_mask = to_tensor(data_dict[f"heldin_spike_mask"]).to(torch.bool)
+                encod_mean_std = mean_std[:, heldin_mask, :]
+                recon_mean_std = torch.cat([
+                    mean_std[:, heldin_mask, :],
+                    mean_std[:, ~heldin_mask, :]
+                ], dim=1)
+            else:
+                encod_mean_std = torch.full((n_samps, 0, 0), float("nan"))
+                recon_mean_std = torch.full((n_samps, 0, 0), float("nan"))
             # Remove unnecessary data during IC encoder segment
             sv_mask = sv_mask[:, hps.dm_ic_enc_seq_len :]
             ext_input = ext_input[:, hps.dm_ic_enc_seq_len :]
@@ -67,9 +110,14 @@ def attach_tensors(datamodule, data_dicts: list[dict], extra_keys: list[str] = [
                 SessionBatch(
                     encod_data=encod_data,
                     recon_data=recon_data,
+                    encod_mask=encod_mask,
+                    recon_mask=recon_mask,
+                    temp_context=temp_context,
                     ext_input=ext_input,
                     truth=truth,
                     sv_mask=sv_mask,
+                    encod_mean_std=encod_mean_std,
+                    recon_mean_std=recon_mean_std,
                 ),
                 tuple(other),
             )
@@ -140,6 +188,7 @@ class BasicDataModule(pl.LightningDataModule):
         sv_rate: float = 0.0,
         sv_seed: int = 0,
         dm_ic_enc_seq_len: int = 0,
+        use_ext_input: bool = True,
     ):
         assert (
             reshuffle_tv_seed is None or len(attr_keys) == 0
@@ -219,3 +268,39 @@ class BasicDataModule(pl.LightningDataModule):
                     shuffle=False,
                 )
         return dataloaders
+
+
+class TemporalContextDataModule(BasicDataModule):
+    def __init__(
+        self,
+        data_paths: list[str],
+        batch_keys: list[str] = [],
+        attr_keys: list[str] = [],
+        batch_size: int = 64,
+        reshuffle_tv_seed: int = None,
+        reshuffle_tv_ratio: float = None,
+        sv_rate: float = 0.0,
+        sv_seed: int = 0,
+        # dm_ic_enc_seq_len: int = 0,
+        impute_value: float = 0.,
+        temp_context_field: str = None,
+        rescale_temp_context: bool = True,
+        rescale_temp_context_min: float = 0.0,
+        rescale_temp_context_max: float = 1.0,
+        ext_input_fields: list[str] = [],
+        ext_input_lag: int = None,
+        spike_mean_field: str = None,
+        spike_std_field: str = None,
+    ):
+        super().__init__(
+            data_paths=data_paths,
+            batch_keys=batch_keys,
+            attr_keys=attr_keys,
+            batch_size=batch_size,
+            reshuffle_tv_seed=reshuffle_tv_seed,
+            reshuffle_tv_ratio=reshuffle_tv_ratio,
+            sv_rate=sv_rate,
+            sv_seed=sv_seed,
+            # dm_ic_enc_seq_len=dm_ic_enc_seq_len,
+        )
+        self.save_hyperparameters()

@@ -23,6 +23,10 @@ class Reconstruction(abc.ABC):
     @abc.abstractmethod
     def reshape_output_params(self, output_params):
         pass
+    
+    @abc.abstractmethod
+    def rescale_output_params(self, output_params):
+        pass
 
     @abc.abstractmethod
     def compute_loss(self, data, output_params):
@@ -39,6 +43,12 @@ class Poisson(Reconstruction):
 
     def reshape_output_params(self, output_params):
         return torch.unsqueeze(output_params, dim=-1)
+
+    def rescale_output_params(self, output_params, loc, scale):
+        # output_params: # B x T x N x 1
+        # loc/scale: # B x N
+        # mean = scale, so ignore loc
+        return output_params + torch.log(scale[:, None, :, None])
 
     def compute_loss(self, data, output_params):
         return F.poisson_nll_loss(
@@ -72,6 +82,11 @@ class MSE(Reconstruction):
     def reshape_output_params(self, output_params):
         return torch.unsqueeze(output_params, dim=-1)
 
+    def rescale_output_params(self, output_params, loc, scale):
+        # output_params: # B x T x N x 1
+        # loc/scale: # B x N
+        return (output_params + loc[:, None, :, None]) * scale[:, None, :, None]
+
     def compute_loss(self, data, output_params):
         return (data - output_params[..., 0]) ** 2
 
@@ -86,6 +101,15 @@ class Gaussian(Reconstruction):
     def reshape_output_params(self, output_params):
         means, logvars = torch.chunk(output_params, 2, -1)
         return torch.stack([means, logvars], -1)
+
+    def rescale_output_params(self, output_params, loc, scale):
+        # output_params: # B x T x N x 2
+        # loc/scale: # B x N
+        output_params = torch.stack([
+            output_params[..., 0] + loc[:, None, :],
+            output_params[..., 1] + scale[:, None, :], # logvar
+        ], dim=-1)
+        return output_params
 
     def compute_loss(self, data, output_params):
         means, logvars = torch.unbind(output_params, axis=-1)
@@ -105,6 +129,12 @@ class Gamma(Reconstruction):
     def reshape_output_params(self, output_params):
         logalphas, logbetas = torch.chunk(output_params, chunks=2, dim=-1)
         return torch.stack([logalphas, logbetas], -1)
+
+    def rescale_output_params(self, output_params, loc, scale):
+        # output_params: # B x T x N x 2
+        # loc/scale: # B x N
+        # dunno what i'm doing
+        return output_params
 
     def compute_loss(self, data, output_params):
         alphas, betas = torch.unbind(torch.exp(output_params), axis=-1)
@@ -138,6 +168,12 @@ class ZeroInflatedGamma(nn.Module, Reconstruction):
     def reshape_output_params(self, output_params):
         alpha_ps, beta_ps, q_ps = torch.chunk(output_params, chunks=3, dim=-1)
         return torch.stack([alpha_ps, beta_ps, q_ps], -1)
+
+    def rescale_output_params(self, output_params, loc, scale):
+        # output_params: # B x T x N x 3
+        # loc/scale: # B x N
+        # dunno what i'm doing
+        return output_params
 
     def compute_loss(self, data, output_params):
         # Compute the scaled output parameters

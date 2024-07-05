@@ -1,3 +1,4 @@
+import math
 import pytorch_lightning as pl
 import torch
 from torch import nn
@@ -67,6 +68,16 @@ class LFADS(pl.LightningModule):
         kl_increase_epoch: int,
         kl_ic_scale: float,
         kl_co_scale: float,
+        context_start_var: float,
+        context_var_start_epoch: int,
+        context_stop_var: float,
+        context_var_stop_epoch: int,
+        standardize_encod: bool,
+        use_encod_mask: bool,
+        use_enc_context: bool,
+        use_dec_context: bool,
+        use_readout_context: bool,
+        destandardize_recon: bool,
     ):
         super().__init__()
         self.save_hyperparameters(
@@ -79,6 +90,10 @@ class LFADS(pl.LightningModule):
         self.hparams.co_prior = co_prior
         # Make sure the nn.ModuleList arguments are all the same length
         assert len(readin) == len(readout) == len(reconstruction)
+        if len(readin) == 1: # ugly solution. TODO: cleanup?
+            self.multi_mode = False
+        else:
+            self.multi_mode = True
         # Make sure that non-variational models use null priors
         if not variational:
             assert isinstance(ic_prior, Null) and isinstance(co_prior, Null)
@@ -102,6 +117,17 @@ class LFADS(pl.LightningModule):
         # Store the data augmentation stacks
         self.train_aug_stack = train_aug_stack
         self.infer_aug_stack = infer_aug_stack
+        # Extra stuffs
+        self.context_start_var = context_start_var
+        self.context_var_start_epoch = context_var_start_epoch
+        self.context_stop_var = context_stop_var
+        self.context_var_stop_epoch = context_var_stop_epoch
+        self.standardize_encod = standardize_encod
+        self.use_encod_mask = use_encod_mask
+        self.use_enc_context = use_enc_context
+        self.use_dec_context = use_dec_context
+        self.use_readout_context = use_readout_context
+        self.destandardize_recon = destandardize_recon
 
     def forward(
         self,
@@ -117,16 +143,48 @@ class LFADS(pl.LightningModule):
         # Keep track of batch sizes so we can split back up
         batch_sizes = [len(batch[s].encod_data) for s in sessions]
         # Pass the data through the readin networks
-        encod_data = torch.cat([self.readin[s](batch[s].encod_data) for s in sessions])
+        def rescale_spikes(session_batch):
+            if session_batch.encod_mean_std.shape[-1] <= 0 or not self.standardize_encod:
+                return session_batch.encod_data
+            session_means = session_batch.encod_mean_std[:, :, 0]
+            session_stds = session_batch.encod_mean_std[:, :, 1]
+            session_means[torch.isnan(session_means)] = 0.
+            session_stds[torch.isnan(session_stds)] = 1.
+            return (session_batch.encod_data - session_means[:, None, :]) / session_stds[:, None, :]
+            # return session_batch.encod_data / session_stds[:, None, :]
+        if self.multi_mode:
+            encod_data = torch.cat([self.readin[s](rescale_spikes(batch[s])) for s in sessions])
+        else:
+            encod_data = torch.cat([self.readin[0](rescale_spikes(batch[s])) for s in sessions])
+        encod_mask = torch.cat([batch[s].encod_mask for s in sessions])
         # Collect the external inputs
         ext_input = torch.cat([batch[s].ext_input for s in sessions])
+        temp_context = torch.cat([batch[s].temp_context for s in sessions])
+        trial_len = encod_data.shape[1]
+        temp_context = torch.tile(temp_context[:, None, :], dims=(1, trial_len, 1))
+        denoised_temp_context = temp_context
+        if self.current_epoch <= self.context_var_start_epoch:
+            context_var = self.context_start_var
+        elif self.current_epoch <= self.context_var_stop_epoch:
+            alpha = (self.context_var_stop_epoch - self.current_epoch) / (self.context_var_stop_epoch - self.context_var_start_epoch)
+            context_var = self.context_start_var * alpha + self.context_stop_var * (1 - alpha)
+        else:
+            context_var = self.context_stop_var
+        if context_var > 0.:
+            temp_context += torch.normal(0., math.sqrt(context_var), size=temp_context.shape, device=temp_context.device)
         # Pass the data through the encoders
+        if self.use_encod_mask:
+            encod_data = torch.cat([encod_data, encod_mask], dim=-1)
+        if self.use_enc_context:
+            encod_data = torch.cat([encod_data, temp_context], dim=-1)
         ic_mean, ic_std, ci = self.encoder(encod_data)
         # Create the posterior distribution over initial conditions
         ic_post = self.ic_prior.make_posterior(ic_mean, ic_std)
         # Choose to take a sample or to pass the mean
         ic_samp = ic_post.rsample() if sample_posteriors else ic_mean
         # Unroll the decoder to estimate latent states
+        if self.use_dec_context:
+            ext_input = torch.cat([ext_input, temp_context], dim=-1)
         (
             gen_init,
             gen_states,
@@ -138,18 +196,56 @@ class LFADS(pl.LightningModule):
         ) = self.decoder(ic_samp, ci, ext_input, sample_posteriors=sample_posteriors)
         # Convert the factors representation into output distribution parameters
         factors = torch.split(factors, batch_sizes)
-        output_params = [self.readout[s](f) for s, f in zip(sessions, factors)]
+        denoised_temp_context = torch.split(denoised_temp_context, batch_sizes)
+        if self.use_readout_context:
+            factors = [
+                torch.cat([f, denoised_temp_context], dim=-1)
+                for f in factors
+            ]
+        if self.multi_mode:
+            output_params = [self.readout[s](f) for s, f in zip(sessions, factors)]
+        else:
+            output_params = [self.readout[0](f) for s, f in zip(sessions, factors)]
         # Separate parameters of the output distribution
+        if self.multi_mode:
+            output_params = [
+                self.recon[s].reshape_output_params(op)
+                for s, op in zip(sessions, output_params)
+            ]
+        else:
+            output_params = [
+                self.recon[0].reshape_output_params(op)
+                for s, op in zip(sessions, output_params)
+            ]
+        # rescale parameters
+        def rescale_params(s, op): # arguably add to recons
+            if batch[s].recon_mean_std.shape[-1] <= 0 or not self.destandardize_recon:
+                return op
+            session_means = batch[s].recon_mean_std[:, :, 0]
+            session_stds = batch[s].recon_mean_std[:, :, 1]
+            session_means[torch.isnan(session_means)] = 0.
+            session_stds[torch.isnan(session_stds)] = 1.
+            if self.multi_mode:
+                op = self.recon[s].rescale_output_params(op, session_means, session_stds)
+            else:
+                op = self.recon[0].rescale_output_params(op, session_means, session_stds)
+            return op
         output_params = [
-            self.recon[s].reshape_output_params(op)
+            rescale_params(s, op)
             for s, op in zip(sessions, output_params)
         ]
         # Convert the output parameters to means if requested
         if output_means:
-            output_params = [
-                self.recon[s].compute_means(op)
-                for s, op in zip(sessions, output_params)
-            ]
+            if self.multi_mode:
+                output_params = [
+                    self.recon[s].compute_means(op)
+                    for s, op in zip(sessions, output_params)
+                ]
+            else:
+                output_params = [
+                    self.recon[0].compute_means(op)
+                    for s, op in zip(sessions, output_params)
+                ]
         # Separate model outputs by session
         output = transpose_lists(
             [
@@ -224,10 +320,16 @@ class LFADS(pl.LightningModule):
             batch, sample_posteriors=hps.variational, output_means=False
         )
         # Compute the reconstruction loss
-        recon_all = [
-            self.recon[s].compute_loss(batch[s].recon_data, output[s].output_params)
-            for s in sessions
-        ]
+        if self.multi_mode:
+            recon_all = [
+                self.recon[s].compute_loss(batch[s].recon_data, output[s].output_params)
+                for s in sessions
+            ]
+        else:
+            recon_all = [
+                self.recon[0].compute_loss(batch[s].recon_data, output[s].output_params)
+                for s in sessions
+            ]
         # Apply losses processing
         recon_all = [
             aug_stack.process_losses(ra, batch[s], self.log, split)
@@ -271,9 +373,14 @@ class LFADS(pl.LightningModule):
         loss = hps.loss_scale * (recon + l2_ramp * l2 + kl_ramp * (ic_kl + co_kl))
         # Compute the reconstruction accuracy, if applicable
         if batch[0].truth.numel() > 0:
-            output_means = [
-                self.recon[s].compute_means(output[s].output_params) for s in sessions
-            ]
+            if self.multi_mode:
+                output_means = [
+                    self.recon[s].compute_means(output[s].output_params) for s in sessions
+                ]
+            else:
+                output_means = [
+                    self.recon[0].compute_means(output[s].output_params) for s in sessions
+                ]
             r2 = torch.mean(
                 torch.stack(
                     [
@@ -291,6 +398,28 @@ class LFADS(pl.LightningModule):
             self.log(
                 name=f"{split}/recon/sess{s}",
                 value=recon_value,
+                on_step=False,
+                on_epoch=True,
+                batch_size=batch_size,
+            )
+        for i, (s, batch_size) in enumerate(zip(sessions, batch_sizes)):
+            self.log(
+                name=f"{split}/bps/sess{s}",
+                value=max(sess_bps[i], -1.0),
+                on_step=False,
+                on_epoch=True,
+                batch_size=batch_size,
+            )
+            self.log(
+                name=f"{split}/co_bps/sess{s}",
+                value=max(sess_co_bps[i], -1.0),
+                on_step=False,
+                on_epoch=True,
+                batch_size=batch_size,
+            )
+            self.log(
+                name=f"{split}/fp_bps/sess{s}",
+                value=max(sess_fp_bps[i], -1.0),
                 on_step=False,
                 on_epoch=True,
                 batch_size=batch_size,

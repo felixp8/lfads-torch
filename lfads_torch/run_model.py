@@ -56,6 +56,9 @@ def run_model(
     if checkpoint_dir:
         ckpt_pattern = os.path.join(checkpoint_dir, "*.ckpt")
         ckpt_path = max(glob(ckpt_pattern), key=os.path.getctime)
+        
+    if save_config:
+        OmegaConf.save(config, "config.yaml", resolve=True)
 
     if do_train:
         # If both ray.tune and wandb are being used, ensure that loggers use same name
@@ -84,8 +87,6 @@ def run_model(
         if config.posterior_sampling.use_best_ckpt:
             ckpt_path = trainer.checkpoint_callback.best_model_path
             model.load_state_dict(torch.load(ckpt_path)["state_dict"])
-        if save_config:
-            OmegaConf.save(config, "config.yaml", resolve=True)
     else:
         if checkpoint_dir:
             # If not training, restore model from the checkpoint

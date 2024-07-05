@@ -1,0 +1,12 @@
+_target_: lfads_torch.datamodules.TemporalContextDataModule
+data_paths:
+  - /home/fpei2/orsborn/data/lfads/jeev070412_072012_neur=drop_chop=80.h5
+  # - /home/fpei2/orsborn/data/lfads/jeev070412_072012_neur=mask_chop=80.h5
+batch_size: 256
+impute_value: 0.0
+temp_context_field: "day"
+rescale_temp_context: True
+ext_input_fields: []
+ext_input_lag: null
+spike_mean_field: "spike_means"
+spike_std_field: "spike_stds"

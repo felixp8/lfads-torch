@@ -226,7 +226,7 @@ class SampleValidation:
         return sv_input, *other_data
 
     def process_losses(self, recon_loss, batch, log_fn, data_split):
-        sv_mask = batch[2]
+        sv_mask = batch[7]
         # Aggregate and log recon cost for samples heldout for SV
         if self.sv_rate == 0:
             # Skip the masking if SV is not being used
@@ -268,6 +268,30 @@ class SelectiveBackpropThruTime:
         # (zero won't work for ZIG and ones are used in place of zeros)
         recon_data_interp = torch.nan_to_num(recon_data, nan=10)
         return encod_data_interp, recon_data_interp, *other_data
+
+    def process_losses(self, recon_loss, *args):
+        # First-in-first-out
+        isnan_mask = self.isnan_masks.pop(0)
+        # Convert missing losses into zeros and scale up so mean is unchanged
+        frac_isnan = isnan_mask.sum() / isnan_mask.numel()
+        recon_loss[isnan_mask] = 0
+        return recon_loss / (1 - frac_isnan)
+
+    def reset(self):
+        self.isnan_masks = []
+
+
+class GradBlock:
+    # literally just SBTT but the masks are already in the batch
+    def __init__(self):
+        super().__init__()
+        self.isnan_masks = []
+
+    def process_batch(self, batch):
+        encod_data, recon_data, encod_mask, recon_mask, *other_data = batch
+        # Remember where NaNs exist in the recon data
+        self.isnan_masks.append(recon_mask)
+        return encod_data, recon_data, encod_mask, recon_mask, *other_data
 
     def process_losses(self, recon_loss, *args):
         # First-in-first-out

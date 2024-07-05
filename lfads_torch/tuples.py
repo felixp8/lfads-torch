@@ -5,9 +5,14 @@ SessionBatch = namedtuple(
     [
         "encod_data",
         "recon_data",
+        "encod_mask",
+        "recon_mask",
+        "temp_context",
         "ext_input",
         "truth",
         "sv_mask",
+        "encod_mean_std",
+        "recon_mean_std",
     ],
 )
 
